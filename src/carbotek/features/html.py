@@ -51,6 +51,79 @@ _NUMBERING_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingm
 _STYLES_REL = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles"
 _STYLES_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"
 _HEADING_STYLE = (("2F5496", 32), ("2F5496", 26), ("1F3763", 24), ("2F5496", 22), ("2F5496", 22), ("1F3763", 22))
+# Bullets of generated lists name no font, so they are drawn in the font of the item text. All three
+# characters are in both Windows-1251 and Windows-1252: a font that can show the text has them too.
+_BULLET_GLYPHS = ("\N{BULLET}", "\N{EN DASH}", "\N{MIDDLE DOT}")
+
+
+class _HtmlStyles:
+    """Template styles that generated HTML blocks use, found by their built-in names.
+
+    Word stores a built-in style under its English name in every UI language but localizes the id:
+    in a document saved by Russian Word ``heading 1`` is ``1`` and ``Hyperlink`` is ``a5``. A fallback
+    definition is added only for a style the output uses and the template does not have.
+    """
+
+    def __init__(self, package: TemplatePackage) -> None:
+        self.package = package
+        self.missing: set[str] = set()
+        self._root: etree._Element | None = None
+        self._ids: set[str] = set()
+        self._by_name: dict[tuple[str, str], str] = {}
+        self._normal = "Normal"
+        self._loaded = False
+
+    @property
+    def root(self) -> etree._Element:
+        """``word/styles.xml`` of the template (parsed on first use), or a new empty one."""
+        self._load()
+        if self._root is None:
+            self._root = etree.Element(qn("w:styles"), nsmap={"w": NAMESPACES["w"]})
+        return self._root
+
+    @property
+    def normal(self) -> str:
+        """The id of the template's default paragraph style, the base of fallback headings."""
+        self._load()
+        return self._normal
+
+    def heading(self, level: int) -> str:
+        return self._resolve("paragraph", f"heading {level}", f"Heading{level}")
+
+    def hyperlink(self) -> str:
+        return self._resolve("character", "hyperlink", "Hyperlink")
+
+    def table_grid(self) -> str:
+        return self._resolve("table", "table grid", "TableGrid")
+
+    def _resolve(self, kind: str, name: str, fallback: str) -> str:
+        self._load()
+        found = self._by_name.get((kind, name))
+        if found is not None:
+            return found
+        if fallback not in self._ids:
+            self.missing.add(fallback)
+        return fallback
+
+    def _load(self) -> None:
+        if self._loaded:
+            return
+        self._loaded = True
+        part = self.package.parts.get("word/styles.xml")
+        if part is None:
+            return
+        self._root = parse_xml(part.content)
+        default = ""
+        for style in self._root.findall(qn("w:style")):
+            style_id = style.get(qn("w:styleId"), "")
+            kind = style.get(qn("w:type"), "paragraph")
+            self._ids.add(style_id)
+            name = style.find(qn("w:name"))
+            if name is not None:
+                self._by_name.setdefault((kind, name.get(qn("w:val"), "").casefold()), style_id)
+            if kind == "paragraph" and style.get(qn("w:default")) in {"1", "true", "on"} and not default:
+                default = style_id
+        self._normal = default or self._by_name.get(("paragraph", "normal"), "Normal")
 
 
 class _HtmlNumbering:
@@ -94,23 +167,17 @@ class _HtmlNumbering:
 
     @staticmethod
     def add_level(abstract: etree._Element, ordered: bool, level: int, start: int = 1) -> None:
-        """``getListStyleDocx(type, level)``: Symbol/Courier New/Wingdings bullets or ``%N.``."""
-        variant = level % 3
+        """``getListStyleDocx(type, level)``, but bullets take the item's font instead of Symbol/Wingdings."""
         definition = etree.SubElement(abstract, qn("w:lvl"))
         definition.set(qn("w:ilvl"), str(level))
         etree.SubElement(definition, qn("w:start")).set(qn("w:val"), str(start))
         etree.SubElement(definition, qn("w:numFmt")).set(qn("w:val"), "decimal" if ordered else "bullet")
-        etree.SubElement(definition, qn("w:lvlText")).set(qn("w:val"), f"%{level + 1}." if ordered else "o"[variant])
+        label = f"%{level + 1}." if ordered else _BULLET_GLYPHS[level % len(_BULLET_GLYPHS)]
+        etree.SubElement(definition, qn("w:lvlText")).set(qn("w:val"), label)
         etree.SubElement(definition, qn("w:lvlJc")).set(qn("w:val"), "left")
         indent = etree.SubElement(etree.SubElement(definition, qn("w:pPr")), qn("w:ind"))
         indent.set(qn("w:left"), str(720 + level * 720))
         indent.set(qn("w:hanging"), "360")
-        if not ordered:
-            font = ("Symbol", "Courier New", "Wingdings")[variant]
-            fonts = etree.SubElement(etree.SubElement(definition, qn("w:rPr")), qn("w:rFonts"))
-            fonts.set(qn("w:ascii"), font)
-            fonts.set(qn("w:hAnsi"), font)
-            fonts.set(qn("w:hint"), "default")
 
     def part(self) -> TemplatePart:
         return TemplatePart(
@@ -121,7 +188,9 @@ class _HtmlNumbering:
 
 
 class _HtmlLinks:
-    def __init__(self, package: TemplatePackage, part_name: str, numbering: _HtmlNumbering) -> None:
+    def __init__(
+        self, package: TemplatePackage, part_name: str, numbering: _HtmlNumbering, styles: _HtmlStyles
+    ) -> None:
         parent, _, filename = part_name.rpartition("/")
         self.part_name = f"{parent}/_rels/{filename}.rels"
         existing = package.parts.get(self.part_name)
@@ -129,12 +198,10 @@ class _HtmlLinks:
         self.used = {node.get("Id") for node in self.root}
         self.urls: dict[str, str] = {}
         self.changed = False
-        self.has_links = False
-        self.has_headings = False
-        self.has_table = False
         self.image_counter = 0
         self.literal_texts: set[etree._Element] = set()
         self.numbering = numbering
+        self.styles = styles
         self.current_list: tuple[int, etree._Element, int] | None = None
         self.table_theme = ""
         self.heading_theme = ""
@@ -144,10 +211,8 @@ class _HtmlLinks:
     def target(self, href: str) -> tuple[str, str] | None:
         anchor = _anchor(href)
         if anchor is not None:
-            self.has_links = True
             return "anchor", anchor
         url = check_url(href)
-        self.has_links = True
         if url in self.urls:
             return "id", self.urls[url]
         index = 0
@@ -211,52 +276,45 @@ def _write_numbering(
     return True
 
 
-def _write_styles(
-    package: TemplatePackage,
-    replacements: dict[str, TemplatePart],
-    has_links: bool,
-    has_headings: bool,
-    has_table: bool,
-) -> bool:
-    if not (has_links or has_headings or has_table):
+def _write_styles(package: TemplatePackage, replacements: dict[str, TemplatePart], styles: _HtmlStyles) -> bool:
+    """Add the fallback styles that the output uses and the template lacks, in a fixed order."""
+    if not styles.missing:
         return False
     name = "word/styles.xml"
-    existing = package.parts.get(name)
-    root = (
-        parse_xml(existing.content)
-        if existing is not None
-        else etree.Element(qn("w:styles"), nsmap={"w": NAMESPACES["w"]})
-    )
-    used = {style.get(qn("w:styleId")) for style in root.findall(qn("w:style"))}
-    if has_links and "Hyperlink" not in used:
-        style = etree.SubElement(root, qn("w:style"))
-        style.set(qn("w:type"), "character")
-        style.set(qn("w:styleId"), "Hyperlink")
-        etree.SubElement(style, qn("w:name")).set(qn("w:val"), "Hyperlink")
-        etree.SubElement(style, qn("w:uiPriority")).set(qn("w:val"), "99")
-        properties = etree.SubElement(style, qn("w:rPr"))
-        link_color = etree.SubElement(properties, qn("w:color"))
-        link_color.set(qn("w:val"), "0563C1")
-        link_color.set(qn("w:themeColor"), "hyperlink")
-        etree.SubElement(properties, qn("w:u")).set(qn("w:val"), "single")
-    if has_headings:
-        for level in range(1, 7):
-            if f"Heading{level}" not in used:
-                _add_heading_style(root, level)
-    if has_table and "TableGrid" not in used:
+    root = styles.root
+    if "Hyperlink" in styles.missing:
+        _add_hyperlink_style(root)
+    for level in range(1, 7):
+        if f"Heading{level}" in styles.missing:
+            _add_heading_style(root, level, styles.normal)
+    if "TableGrid" in styles.missing:
         _add_table_style(root)
     replacements[name] = TemplatePart(name, serialize_xml(root), True)
     _ensure_part_link(package, replacements, name, _STYLES_REL, _STYLES_MIME)
     return True
 
 
-def _add_heading_style(root: etree._Element, level: int) -> None:
+def _add_hyperlink_style(root: etree._Element) -> None:
+    style = etree.SubElement(root, qn("w:style"))
+    style.set(qn("w:type"), "character")
+    style.set(qn("w:styleId"), "Hyperlink")
+    etree.SubElement(style, qn("w:name")).set(qn("w:val"), "Hyperlink")
+    etree.SubElement(style, qn("w:uiPriority")).set(qn("w:val"), "99")
+    properties = etree.SubElement(style, qn("w:rPr"))
+    link_color = etree.SubElement(properties, qn("w:color"))
+    link_color.set(qn("w:val"), "0563C1")
+    link_color.set(qn("w:themeColor"), "hyperlink")
+    etree.SubElement(properties, qn("w:u")).set(qn("w:val"), "single")
+
+
+def _add_heading_style(root: etree._Element, level: int, based_on: str) -> None:
+    """``getHeadingStyleDocx`` without its Aptos font: the heading keeps the template's body font."""
     color, size = _HEADING_STYLE[level - 1]
     style = etree.SubElement(root, qn("w:style"))
     style.set(qn("w:type"), "paragraph")
     style.set(qn("w:styleId"), f"Heading{level}")
     etree.SubElement(style, qn("w:name")).set(qn("w:val"), f"heading {level}")
-    etree.SubElement(style, qn("w:basedOn")).set(qn("w:val"), "Normal")
+    etree.SubElement(style, qn("w:basedOn")).set(qn("w:val"), based_on)
     etree.SubElement(style, qn("w:qFormat"))
     paragraph = etree.SubElement(style, qn("w:pPr"))
     etree.SubElement(paragraph, qn("w:outlineLvl")).set(qn("w:val"), str(level - 1))
@@ -264,9 +322,6 @@ def _add_heading_style(root: etree._Element, level: int) -> None:
     spacing.set(qn("w:before"), "240" if level == 1 else "40")
     spacing.set(qn("w:after"), "0")
     properties = etree.SubElement(style, qn("w:rPr"))
-    fonts = etree.SubElement(properties, qn("w:rFonts"))
-    for attr in ("ascii", "hAnsi", "cs"):
-        fonts.set(qn(f"w:{attr}"), "Aptos")
     etree.SubElement(properties, qn("w:color")).set(qn("w:val"), color)
     for tag in ("sz", "szCs"):
         etree.SubElement(properties, qn(f"w:{tag}")).set(qn("w:val"), str(size))
@@ -340,12 +395,10 @@ class HtmlSubstitution:
     ) -> TemplatePackage:
         replacements: dict[str, TemplatePart] = {}
         numbering = _HtmlNumbering(package)
+        styles = _HtmlStyles(package)
         registry = shared_registry()
         context = MarkerContext(data=dict(data) if is_mapping(data) else {}, complement=dict(options.complement))
         new_relationships = False
-        has_links = False
-        has_headings = False
-        has_table = False
         for part in package.parts.values():
             if not part.is_xml or not part.name.startswith(
                 ("word/document", "word/header", "word/footer", "word/footnotes", "word/endnotes")
@@ -354,15 +407,12 @@ class HtmlSubstitution:
             if not part.contains(":html", attributes=False):
                 continue  # no HTML marker left in this part
             root = part.tree()
-            links = _HtmlLinks(package, part.name, numbering)
+            links = _HtmlLinks(package, part.name, numbering, styles)
             if _replace_html_markers(root, data, links, options, registry, context):
                 replacements[part.name] = TemplatePart.from_tree(part.name, root)
             if links.changed:
                 replacements[links.part_name] = links.part()
                 new_relationships = True
-            has_links = has_links or links.has_links
-            has_headings = has_headings or links.has_headings
-            has_table = has_table or links.has_table
         if new_relationships := _write_numbering(package, replacements, numbering) or new_relationships:
             content_types = package.parts.get("[Content_Types].xml")
             if content_types is not None:
@@ -379,7 +429,7 @@ class HtmlSubstitution:
                         serialize_xml(types_root),
                         True,
                     )
-        if _write_styles(package, replacements, has_links, has_headings, has_table):
+        if _write_styles(package, replacements, styles):
             _ensure_rels_content_type(package, replacements)
         return package.replace_parts(replacements) if replacements else package
 
@@ -693,6 +743,8 @@ def _apply_template_style(
                     paragraph.insert(0, properties)
                 if properties.find(str(item.tag)) is None:
                     _insert_ordered(properties, deepcopy(item), _PPR_ORDER)
+            if run_style and properties is not None and properties.find(qn("w:numPr")) is not None:
+                _apply_mark_style(properties, run_style)
         for run in runs:
             if run.find(qn("w:t")) is None:
                 continue
@@ -703,6 +755,21 @@ def _apply_template_style(
                     run.insert(0, properties)
                 if properties.find(str(item.tag)) is None:
                     _insert_ordered(properties, deepcopy(item), _RPR_ORDER)
+
+
+def _apply_mark_style(properties: etree._Element, run_style: list[etree._Element]) -> None:
+    """Word and the PDF engine draw a list label with the paragraph mark's formatting.
+
+    lib/html.js gives list paragraphs the template run style there too, so a bullet or number has
+    the font, size and color of the item text.
+    """
+    mark = properties.find(qn("w:rPr"))
+    if mark is None:
+        mark = etree.Element(qn("w:rPr"))
+        _insert_ordered(properties, mark, _PPR_ORDER)
+    for item in run_style:
+        if mark.find(str(item.tag)) is None:
+            _insert_ordered(mark, deepcopy(item), _RPR_ORDER)
 
 
 def _split_paragraph(
@@ -942,13 +1009,13 @@ def _inherited_html_style(style: str) -> str:
 
 def _table_from_html(node: etree._Element, links: _HtmlLinks) -> etree._Element:
     """Build a minimal valid Word table from HTML ``tr``/``th``/``td`` nodes."""
-    links.has_table = links.has_table or not links.table_theme  # a theme names an existing style
     rows = node.xpath("./tr | ./thead/tr | ./tbody/tr | ./tfoot/tr")
     layout = _table_layout(rows)
     column_count = max((start + span for row in layout for _, start, span, _ in row), default=1)
     table = etree.Element(qn("w:tbl"))
     properties = etree.SubElement(table, qn("w:tblPr"))
-    etree.SubElement(properties, qn("w:tblStyle")).set(qn("w:val"), links.table_theme or "TableGrid")
+    # A theme names an existing style; without one the template's "Table Grid" or a fallback is used.
+    etree.SubElement(properties, qn("w:tblStyle")).set(qn("w:val"), links.table_theme or links.styles.table_grid())
     width = etree.SubElement(properties, qn("w:tblW"))
     width.set(qn("w:w"), "5000")
     width.set(qn("w:type"), "pct")
@@ -1072,9 +1139,10 @@ def _paragraph_from_html(node: etree._Element, links: _HtmlLinks) -> etree._Elem
     paragraph = etree.Element(qn("w:p"))
     tag = _html_tag(node)
     if tag in {"h1", "h2", "h3", "h4", "h5", "h6"}:
-        links.has_headings = links.has_headings or not links.heading_theme
+        level = int(tag[1:])
+        style_id = f"{links.heading_theme}{level}" if links.heading_theme else links.styles.heading(level)
         properties = etree.SubElement(paragraph, qn("w:pPr"))
-        etree.SubElement(properties, qn("w:pStyle")).set(qn("w:val"), f"{links.heading_theme or 'Heading'}{tag[1:]}")
+        etree.SubElement(properties, qn("w:pStyle")).set(qn("w:val"), style_id)
     elif tag == "blockquote" and links.quote_theme:
         properties = etree.SubElement(paragraph, qn("w:pPr"))
         etree.SubElement(properties, qn("w:pStyle")).set(qn("w:val"), links.quote_theme)
@@ -1222,11 +1290,14 @@ def _append_html_runs(
             container = etree.SubElement(paragraph, qn("w:hyperlink"))
             container.set(qn("r:id") if target[0] == "id" else qn("w:anchor"), target[1])
     first_run = len(container)
-    _append_run(container, node.text or "", bold, italic, underline, color, fill, font_size, font_family)
+    link_style = links.styles.hyperlink() if container.tag == qn("w:hyperlink") else None
+    _append_run(container, node.text or "", bold, italic, underline, color, fill, font_size, font_family, link_style)
     for child in node:
         if _html_tag(child) not in {"ul", "ol"}:
             _append_html_runs(container, child, bold, italic, underline, links, color, fill, font_size, font_family)
-        _append_run(container, child.tail or "", bold, italic, underline, color, fill, font_size, font_family)
+        _append_run(
+            container, child.tail or "", bold, italic, underline, color, fill, font_size, font_family, link_style
+        )
     if tag in {"s", "del"}:
         _strike(container[first_run:])
 
@@ -1402,6 +1473,7 @@ def _append_run(
     fill: str | None = None,
     font_size: int | None = None,
     font_family: str | None = None,
+    character_style: str | None = None,
 ) -> None:
     for index, line in enumerate(value.replace("\r\n", "\n").replace("\r", "\n").split("\n")):
         if index:
@@ -1409,20 +1481,11 @@ def _append_run(
         if not line:
             continue
         run = etree.SubElement(paragraph, qn("w:r"))
-        if (
-            bold
-            or italic
-            or underline
-            or color
-            or fill
-            or font_size
-            or font_family
-            or paragraph.tag == qn("w:hyperlink")
-        ):
+        if bold or italic or underline or color or fill or font_size or font_family or character_style:
             # CT_RPr sequence order: rStyle, rFonts, b, bCs, i, iCs, color, sz, szCs, u, shd.
             properties = etree.SubElement(run, qn("w:rPr"))
-            if paragraph.tag == qn("w:hyperlink"):
-                etree.SubElement(properties, qn("w:rStyle")).set(qn("w:val"), "Hyperlink")
+            if character_style:
+                etree.SubElement(properties, qn("w:rStyle")).set(qn("w:val"), character_style)
             if font_family is not None:
                 _set_font_properties(properties, font_family, None)
             if bold:  # lib/html.js xmlStyles.docx: <w:b/><w:bCs/>

@@ -262,6 +262,11 @@ Deliberate, documented differences from the JavaScript engine:
 - Items without a named sort key keep their input order.
 - Each picture keeps its own frame size when several pictures use the same image marker (Carbone
   applies the size of the last of them to all).
+- HTML from `:html` takes its fonts and styles from the template. List bullets name no font and are
+  drawn in the item's font (`•`, `–`, `·` by level; Carbone writes Symbol, Courier New and Wingdings).
+  A missing heading style is added without a font (Carbone uses Aptos) and only for the levels the
+  HTML uses. `heading 1`–`heading 6`, `Hyperlink` and `Table Grid` are found by name, so a template
+  saved by a localized Word keeps using its own styles.
 - Native wheels are built only for Linux; other platforms install the pure-Python wheel, which is not tested there.
 
 ## Development
