@@ -82,8 +82,8 @@ jobs:
   target-image:
     needs: wheel
     runs-on: ubuntu-latest
-    # The production image. Switch to python:3.15-slim-trixie once Docker Hub publishes it.
-    container: python:3.15-rc-slim-trixie
+    # The production image.
+    container: python:3.15-slim-trixie
     steps:
       - uses: actions/checkout@v5
       - uses: actions/download-artifact@v7
