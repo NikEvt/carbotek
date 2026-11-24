@@ -259,6 +259,9 @@ Deliberate, documented differences from the JavaScript engine:
 - An object or array printed by a marker uses JavaScript string conversion (`[object Object]`, `1,2`).
 - A named sort combined with a repeater renders (Carbone fails to compile that template).
 - An empty native chart series is written as `ptCount=0`, as OOXML requires.
+- When workbook preparation removes `xl/sharedStrings.xml` or `xl/calcChain.xml`, their `Override`
+  entries in `[Content_Types].xml` go too (Carbone keeps them, and strict readers such as openpyxl
+  fail on the missing part).
 - Items without a named sort key keep their input order.
 - Each picture keeps its own frame size when several pictures use the same image marker (Carbone
   applies the size of the last of them to all).

@@ -22,6 +22,8 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from functools import cmp_to_key
 
+from carbotek.ooxml.ns import qn
+from carbotek.ooxml.parts import remove_overrides, target_name
 from carbotek.ooxml.template_options import extract_template_options
 from carbotek.ooxml.xml import parse_xml, serialize_xml
 from carbotek.package import TemplatePackage, TemplatePart
@@ -43,11 +45,12 @@ def prepare_workbook(
     options: dict[str, object] = {}
     for name, text in texts.items():
         texts[name] = extract_template_options(remove_xml_inside_markers(text), options)
-    removed: list[str] = []
-    _remove_one_file(texts, removed, next((name for name in texts if name.endswith("xl/calcChain.xml")), None))
+    calc_name = next((name for name in texts if name.endswith("xl/calcChain.xml")), None)
     shared_name = next((name for name in package.order if name in texts and name.endswith("sharedStrings.xml")), None)
     shared = read_shared_strings(texts[shared_name]) if shared_name is not None else []
-    _remove_one_file(texts, removed, shared_name)
+    removed = [name for name in (calc_name, shared_name) if name is not None]
+    if removed:
+        _remove_workbook_parts(texts, removed)
     as_text = options.get("export_formatted_values_as_text", export_formatted_values_as_text) is True
     pre_release = options.get("pre_release_feature_in", DEFAULT_PRE_RELEASE)
     for name in texts:
@@ -79,29 +82,35 @@ def _xml_text(content: bytes, name: str) -> str:
     return serialize_xml(root).decode("utf-8")
 
 
-def _remove_one_file(texts: dict[str, str], removed: list[str], name: str | None) -> None:
-    """Drop the part, its workbook relationship and its content-type declaration."""
-    if name is None:
-        return
-    removed.append(name)
-    del texts[name]
-    directory, _, basename = name.rpartition("/")
-    relationships = f"{directory}/_rels/workbook.xml.rels" if directory else "/_rels/workbook.xml.rels"
-    if relationships in texts:
-        texts[relationships] = re.sub(
-            r'<Relationship [^>]*Target="' + re.escape(basename) + r'"[^>]*/>', "", texts[relationships], count=1
-        )
+def _remove_workbook_parts(texts: dict[str, str], removed: list[str]) -> None:
+    """``removeOneFile``: drop parts and their workbook relationships.
+
+    Also remove their overrides from ``[Content_Types].xml`` (Carbone keeps them).
+    """
+    for name in removed:
+        del texts[name]
+    removed_names = {name.lower() for name in removed}
+    for name, text in texts.items():
+        directory, separator, filename = f"/{name}".lower().rpartition("/_rels/")
+        if not separator or filename != "workbook.xml.rels":
+            continue
+        source = f"{directory}/workbook.xml"
+        root = parse_xml(text, name)
+        tag = "Relationship" if root.tag == "Relationships" else qn("rel:Relationship")
+        matches = [
+            node
+            for node in root.findall(tag)
+            if node.get("TargetMode") != "External"
+            and target_name(source, node.get("Target", "")).lower() in removed_names
+        ]
+        if matches:
+            for node in matches:
+                root.remove(node)
+            texts[name] = serialize_xml(root).decode("utf-8")
     manifest_name = "[Content_Types].xml"
     if manifest_name in texts:
         manifest = parse_xml(texts[manifest_name], manifest_name)
-        overrides = [
-            entry
-            for entry in manifest.findall("{http://schemas.openxmlformats.org/package/2006/content-types}Override")
-            if entry.get("PartName", "").lower() == f"/{name}".lower()
-        ]
-        for entry in overrides:
-            manifest.remove(entry)
-        if overrides:
+        if remove_overrides(manifest, removed):
             texts[manifest_name] = serialize_xml(manifest).decode("utf-8")
 
 

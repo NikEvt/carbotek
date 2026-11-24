@@ -36,7 +36,7 @@ def test_unchanged_utf8_xml_still_rejects_dtd() -> None:
 
 
 @pytest.mark.parametrize("uppercase_removed_parts", [False, True])
-def test_render_removes_only_retired_workbook_content_types(uppercase_removed_parts: bool) -> None:
+def test_render_cleans_up_references_to_removed_workbook_parts(uppercase_removed_parts: bool) -> None:
     content_types = "http://schemas.openxmlformats.org/package/2006/content-types"
     sheet_ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
     rel_ns = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
@@ -66,10 +66,12 @@ def test_render_removes_only_retired_workbook_content_types(uppercase_removed_pa
             '<sheet name="Sheet1" sheetId="1" r:id="r1"/></sheets></workbook>'
         ),
         "xl/_rels/workbook.xml.rels": (
-            f'<Relationships xmlns="{package_rel}">'
-            f'<Relationship Id="r1" Target="worksheets/sheet1.xml" Type="{rel_ns}/worksheet"/>'
-            f'<Relationship Id="r2" Target="sharedStrings.xml" Type="{rel_ns}/sharedStrings"/>'
-            f'<Relationship Id="r3" Target="calcChain.xml" Type="{rel_ns}/calcChain"/></Relationships>'
+            f"<p:Relationships xmlns:p='{package_rel}'>"
+            f"<p:Relationship Id='r1' Target='worksheets/sheet1.xml' Type='{rel_ns}/worksheet'/>"
+            f"<p:Relationship Id='r2' Target='/XL/SHAREDSTRINGS.XML' Type='{rel_ns}/sharedStrings'/>"
+            f"<p:Relationship Id='r3' Target='../xl/calcChain.xml' Type='{rel_ns}/calcChain'/>"
+            f"<p:Relationship Id='r4' Target='sharedStrings.xml' TargetMode='External' Type='{rel_ns}/hyperlink'/>"
+            "</p:Relationships>"
         ),
         worksheet: (
             f'<worksheet xmlns="{sheet_ns}"><sheetData><row r="1"><c r="A1" t="s"><v>0</v></c>'
@@ -86,6 +88,11 @@ def test_render_removes_only_retired_workbook_content_types(uppercase_removed_pa
     rendered = Engine().render(template.getvalue(), {"name": "Alice"})
     with ZipFile(BytesIO(rendered)) as archive:
         assert {"xl/sharedStrings.xml", "xl/calcChain.xml"}.isdisjoint(archive.namelist())
+        rels = etree.fromstring(archive.read("xl/_rels/workbook.xml.rels"))
+        assert {node.get("Id"): node.get("Target") for node in rels.findall(f"{{{package_rel}}}Relationship")} == {
+            "r1": "worksheets/sheet1.xml",
+            "r4": "sharedStrings.xml",
+        }
         types = etree.fromstring(archive.read("[Content_Types].xml"))
         assert {
             node.get("PartName"): node.get("ContentType") for node in types.findall(f"{{{content_types}}}Override")
