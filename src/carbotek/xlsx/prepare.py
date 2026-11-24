@@ -80,7 +80,7 @@ def _xml_text(content: bytes, name: str) -> str:
 
 
 def _remove_one_file(texts: dict[str, str], removed: list[str], name: str | None) -> None:
-    """``removeOneFile``: drop the part and its relationship in ``<dir>/_rels/workbook.xml.rels``."""
+    """Drop the part, its workbook relationship and its content-type declaration."""
     if name is None:
         return
     removed.append(name)
@@ -91,6 +91,18 @@ def _remove_one_file(texts: dict[str, str], removed: list[str], name: str | None
         texts[relationships] = re.sub(
             r'<Relationship [^>]*Target="' + re.escape(basename) + r'"[^>]*/>', "", texts[relationships], count=1
         )
+    manifest_name = "[Content_Types].xml"
+    if manifest_name in texts:
+        manifest = parse_xml(texts[manifest_name], manifest_name)
+        overrides = [
+            entry
+            for entry in manifest.findall("{http://schemas.openxmlformats.org/package/2006/content-types}Override")
+            if entry.get("PartName", "").lower() == f"/{name}".lower()
+        ]
+        for entry in overrides:
+            manifest.remove(entry)
+        if overrides:
+            texts[manifest_name] = serialize_xml(manifest).decode("utf-8")
 
 
 # --- parser.removeXMLInsideMarkers --------------------------------------------------------------
