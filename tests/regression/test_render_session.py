@@ -1241,7 +1241,7 @@ def test_chart_cleanup_preserves_shared_workbook_graph(engine: Engine, shared: b
             if info.filename == "[Content_Types].xml":
                 types = etree.fromstring(content)
                 for name in (
-                    "word/charts/chart1.xml",
+                    "WORD/CHARTS/CHART1.xml",
                     "word/embeddings/book.xlsx",
                     *(("word/charts/chart2.xml",) if shared else ()),
                 ):

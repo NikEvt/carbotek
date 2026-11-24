@@ -19,6 +19,7 @@ from carbotek.docx.session import CURRENT_RENDER
 from carbotek.errors import MarkerResolutionError
 from carbotek.formatters import MarkerContext
 from carbotek.markers import Marker, VariableEnvironment, parse, scan, substitute
+from carbotek.ooxml.parts import remove_overrides, target_name
 from carbotek.ooxml.xml import parse_xml, serialize_xml
 from carbotek.options import RenderOptions
 from carbotek.package import TemplatePackage, TemplatePart
@@ -134,7 +135,7 @@ def prepare_charts(package: TemplatePackage) -> tuple[TemplatePackage, Mapping[s
                 {
                     target: embedded_cache[target]
                     for relation in parse_xml(package.parts[_rels_name(name)].content)
-                    if (target := _target_name(name, relation.get("Target", ""))) in embedded_cache
+                    if (target := target_name(name, relation.get("Target", ""))) in embedded_cache
                 }
             )
             if _rels_name(name) in package.parts
@@ -149,7 +150,7 @@ def prepare_charts(package: TemplatePackage) -> tuple[TemplatePackage, Mapping[s
         ids = {
             relation.get("Id", "")
             for relation in parse_xml(relation_part.content)
-            if relation.get("Type") == _CHART_REL and _target_name(part.name, relation.get("Target", "")) in plans
+            if relation.get("Type") == _CHART_REL and target_name(part.name, relation.get("Target", "")) in plans
         }
         if not ids:
             continue
@@ -191,7 +192,7 @@ class NativeChartSubstitution:
                 continue
             relationships = parse_xml(original_relationships.content)
             chart_targets = {
-                node.get("Id"): _target_name(part.name, node.get("Target", ""))
+                node.get("Id"): target_name(part.name, node.get("Target", ""))
                 for node in relationships
                 if node.get("Type") == _CHART_REL
             }
@@ -272,7 +273,7 @@ def _prune_chart_relations(
     for relation in tuple(relationships):
         if (
             relation.get("Type") == _CHART_REL
-            and _target_name(part_name, relation.get("Target", "")) in sources
+            and target_name(part_name, relation.get("Target", "")) in sources
             and relation.get("Id") not in used
         ):
             relationships.remove(relation)
@@ -287,7 +288,7 @@ def _remove_chart_templates(package: TemplatePackage, sources: set[str]) -> Temp
         relations = package.parts.get(_rels_name(name))
         if relations is not None:
             candidates.update(
-                _target_name(name, relation.get("Target", ""))
+                target_name(name, relation.get("Target", ""))
                 for relation in parse_xml(relations.content)
                 if relation.get("TargetMode") != "External" and relation.get("Target", "").endswith(".xlsx")
             )
@@ -301,7 +302,7 @@ def _remove_chart_templates(package: TemplatePackage, sources: set[str]) -> Temp
             source = directory + filename.removesuffix(".rels")
             for relation in parse_xml(part.content):
                 if relation.get("TargetMode") != "External":
-                    incoming.add(_target_name(source, relation.get("Target", "")))
+                    incoming.add(target_name(source, relation.get("Target", "")))
         orphaned = candidates - incoming
         if not orphaned:
             break
@@ -311,9 +312,7 @@ def _remove_chart_templates(package: TemplatePackage, sources: set[str]) -> Temp
     if not removed:
         return package
     types = parse_xml(package.parts["[Content_Types].xml"].content)
-    for node in tuple(types):
-        if node.get("PartName", "").lstrip("/") in removed:
-            types.remove(node)
+    remove_overrides(types, removed)
     return package.without_parts(removed).replace_part(TemplatePart("[Content_Types].xml", _xml(types), True))
 
 
@@ -335,7 +334,7 @@ def _clone_chart_dependencies(
     for relation in list(rel_root):
         if not relation.get("Target", "").endswith(".xlsx"):
             continue
-        source_workbook_name = _target_name(source_name, relation.get("Target", ""))
+        source_workbook_name = target_name(source_name, relation.get("Target", ""))
         source_workbook = package.parts.get(source_workbook_name)
         updated_workbook = (
             _sync_workbook(
@@ -739,7 +738,7 @@ def _workbook_cells(
     for relation in parse_xml(relationships.content):
         if not relation.get("Target", "").endswith(".xlsx"):
             continue
-        name = _target_name(chart_name, relation.get("Target", ""))
+        name = target_name(chart_name, relation.get("Target", ""))
         embedded = package.parts.get(name)
         if embedded is None:
             continue
@@ -829,10 +828,6 @@ def _column_name(number: int) -> str:
         number, remainder = divmod(number - 1, 26)
         name = chr(ord("A") + remainder) + name
     return name
-
-
-def _target_name(source: str, target: str) -> str:
-    return posixpath.normpath(posixpath.join(posixpath.dirname(source), target)).lstrip("/")
 
 
 def _rels_name(part_name: str) -> str:
