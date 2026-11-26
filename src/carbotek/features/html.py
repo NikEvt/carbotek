@@ -9,7 +9,7 @@ from dataclasses import dataclass, replace
 from functools import cached_property
 from string import ascii_lowercase, ascii_uppercase
 from typing import Any, Literal
-from urllib.parse import quote, unquote, urlsplit
+from urllib.parse import unquote, urlsplit
 
 from lxml import etree, html  # pyright: ignore[reportAttributeAccessIssue]
 lazy from PIL import ImageColor
@@ -22,7 +22,7 @@ from carbotek.formatters.docx import check_url
 from carbotek.formatters.number import number_string
 from carbotek.markers import Marker
 from carbotek.ooxml.ns import NAMESPACES, qn
-from carbotek.ooxml.parts import target_name
+from carbotek.ooxml.parts import member_name, part_key, part_uri, relationship_part_name, target_name
 from carbotek.ooxml.xml import parse_xml, serialize_xml
 from carbotek.options import RenderOptions
 from carbotek.package import TemplatePackage, TemplatePart
@@ -58,28 +58,6 @@ _HEADING_STYLE = (("2F5496", 32), ("2F5496", 26), ("1F3763", 24), ("2F5496", 22)
 _BULLET_GLYPHS = ("\N{BULLET}", "\N{EN DASH}", "\N{MIDDLE DOT}")
 
 
-def _part_uri(name: str) -> str:
-    return quote(name, safe="/%:!$&'()*+,;=@")
-
-
-def _part_key(name: str) -> str:
-    """Compare URI and IRI spellings with OPC's case-insensitive ASCII rules."""
-    return _part_uri(name).translate(_ASCII_LOWER)
-
-
-def _member_name(package: TemplatePackage, name: str) -> str:
-    """Keep the spelling used in the ZIP package."""
-    if name in package.parts:
-        return name
-    key = _part_key(name)
-    return next((member for member in package.parts if _part_key(member) == key), name)
-
-
-def _rels_name(package: TemplatePackage, source: str) -> str:
-    directory, filename = posixpath.split(source)
-    return _member_name(package, posixpath.join(directory, "_rels", f"{filename}.rels"))
-
-
 def _relationship_root(part: TemplatePart | None) -> etree._Element:
     return parse_xml(part.content, part.name) if part is not None else etree.Element(qn("rel:Relationships"))
 
@@ -106,7 +84,7 @@ class _HtmlPart:
 
     @cached_property
     def rels_name(self) -> str:
-        return _rels_name(self.package, self.package.main_document)
+        return relationship_part_name(self.package.parts, self.package.main_document)
 
     @property
     def relationship_type(self) -> str:
@@ -150,7 +128,7 @@ class _HtmlPart:
 
     @cached_property
     def name(self) -> str:
-        return _member_name(self.package, self.target or f"word/{self.kind}.xml")
+        return member_name(self.package.parts, self.target or f"word/{self.kind}.xml")
 
     @property
     def content_type(self) -> str:
@@ -169,7 +147,7 @@ class _HtmlPart:
                 (
                     node
                     for node in declarations.findall(qn("ct:Override"))
-                    if _part_key(node.get("PartName", "")) == _part_key(f"/{self.name}")
+                    if part_key(node.get("PartName", "")) == part_key(f"/{self.name}")
                 ),
                 None,
             )
@@ -336,7 +314,7 @@ class _HtmlLinks:
     def __init__(
         self, package: TemplatePackage, part_name: str, numbering: _HtmlNumbering, styles: _HtmlStyles
     ) -> None:
-        self.part_name = _rels_name(package, part_name)
+        self.part_name = relationship_part_name(package.parts, part_name)
         self.root = _relationship_root(package.parts.get(self.part_name))
         self.used = {node.get("Id") for node in self.root}
         self.urls: dict[str, str] = {}
@@ -459,15 +437,15 @@ def _ensure_part_link(related: _HtmlPart, replacements: dict[str, TemplatePart])
     if content_types is not None:
         root = parse_xml(replacements.get(content_types.name, content_types).content)
         mime = related.content_type
-        part_name = _part_key(f"/{name}")
+        part_name = part_key(f"/{name}")
         declaration = next(
-            (node for node in root.findall(qn("ct:Override")) if _part_key(node.get("PartName", "")) == part_name),
+            (node for node in root.findall(qn("ct:Override")) if part_key(node.get("PartName", "")) == part_name),
             None,
         )
         if declaration is not None and declaration.get("ContentType", "").translate(_ASCII_LOWER) != mime:
             raise CorruptedTemplateError(f"Invalid DOCX {related.kind} ContentType: {name}")
         if declaration is None:
-            etree.SubElement(root, qn("ct:Override"), PartName=_part_uri(f"/{name}"), ContentType=mime)
+            etree.SubElement(root, qn("ct:Override"), PartName=part_uri(f"/{name}"), ContentType=mime)
             replacements[content_types.name] = TemplatePart(content_types.name, serialize_xml(root), True)
     rel_name = related.rels_name
     rels = _relationship_root(replacements.get(rel_name) or package.parts.get(rel_name))

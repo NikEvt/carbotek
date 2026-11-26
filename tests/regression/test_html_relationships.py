@@ -364,3 +364,36 @@ def test_html_does_not_use_default_for_extensionless_part() -> None:
     )
     with pytest.raises(CorruptedTemplateError, match="Invalid DOCX styles ContentType"):
         Engine().render(template, {"html": "<h1>Section</h1>"})
+
+
+@pytest.mark.parametrize("rels_name", [_RELS_NAME, "word/_RELS/document.xml.rels"])
+def test_html_image_preserves_all_document_relationships(rels_name: str) -> None:
+    png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/v8sAAAAASUVORK5CYII="
+    template = document(
+        paragraph("{d.html:html}"),
+        **{
+            rels_name: _relationships(
+                _relationship("styles", "styles.xml", "rIdStyles"),
+                _relationship("numbering", "numbering.xml", "rIdNumbering"),
+            ),
+            "word/styles.xml": _STYLES,
+            "word/numbering.xml": _NUMBERING,
+            _MANIFEST: _manifest(styles="word/styles.xml", numbering="word/numbering.xml"),
+        },
+    )
+    output = Engine().render(template, {"html": _HTML + f'<p><img src="data:image/png;base64,{png}"></p>'})
+    with ZipFile(BytesIO(output)) as archive:
+        assert [name for name in archive.namelist() if name.lower() == _RELS_NAME] == [rels_name]
+        relationships = {node.get("Id"): node for node in root(output, rels_name)}
+        assert {node.get("Type") for node in relationships.values()} == {
+            f"{_REL_TYPES}/{kind}" for kind in ("styles", "numbering", "hyperlink", "image")
+        }
+        rendered = root(output)
+        assert _values(rendered, "pStyle") == ["CustomHeading"]
+        (bullet_id,) = _values(rendered, "numId")
+        assert _number_formats(root(output, "word/numbering.xml"))[bullet_id][1] == "bullet"
+        (hyperlink,) = list(rendered.iter(qn("w:hyperlink")))
+        assert relationships[hyperlink.get(qn("r:id"))].get("Target") == "https://example.org/new"
+        (image,) = list(rendered.iter(qn("a:blip")))
+        image_target = relationships[image.get(qn("r:embed"))].get("Target")
+        assert f"word/{image_target}" in archive.namelist()
