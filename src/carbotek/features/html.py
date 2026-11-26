@@ -152,10 +152,39 @@ class _HtmlPart:
     def name(self) -> str:
         return _member_name(self.package, self.target or f"word/{self.kind}.xml")
 
+    @property
+    def content_type(self) -> str:
+        return f"application/vnd.openxmlformats-officedocument.wordprocessingml.{self.kind}+xml"
+
     def load(self) -> etree._Element | None:
         part = self.package.parts.get(self.name)
         if part is None:
+            if self.target is not None:
+                raise CorruptedTemplateError(f"Missing DOCX {self.kind} relationship target: {self.name}")
             return None
+        if self.target is not None:
+            manifest = self.package.parts.get("[Content_Types].xml")
+            declarations = parse_xml(manifest.content) if manifest is not None else etree.Element("Types")
+            override = next(
+                (
+                    node
+                    for node in declarations.findall(qn("ct:Override"))
+                    if _part_key(node.get("PartName", "")) == _part_key(f"/{self.name}")
+                ),
+                None,
+            )
+            _, separator, extension = posixpath.basename(self.name).translate(_ASCII_LOWER).rpartition(".")
+            default = next(
+                (
+                    node
+                    for node in declarations.findall(qn("ct:Default"))
+                    if separator and node.get("Extension", "").translate(_ASCII_LOWER) == extension
+                ),
+                None,
+            )
+            declaration = override if override is not None else default
+            if declaration is None or declaration.get("ContentType", "").translate(_ASCII_LOWER) != self.content_type:
+                raise CorruptedTemplateError(f"Invalid DOCX {self.kind} ContentType: {self.name}")
         root = parse_xml(part.content, part.name)
         if root.tag != qn(f"w:{self.kind}"):
             raise CorruptedTemplateError(f"Invalid DOCX {self.kind} part: {part.name}")
@@ -423,23 +452,23 @@ def _add_table_style(root: etree._Element) -> None:
 
 
 def _ensure_part_link(related: _HtmlPart, replacements: dict[str, TemplatePart]) -> bool:
+    if related.target is not None:
+        return False
     package, name = related.package, related.name
     content_types = package.parts.get("[Content_Types].xml")
     if content_types is not None:
         root = parse_xml(replacements.get(content_types.name, content_types).content)
-        mime = f"application/vnd.openxmlformats-officedocument.wordprocessingml.{related.kind}+xml"
+        mime = related.content_type
         part_name = _part_key(f"/{name}")
         declaration = next(
             (node for node in root.findall(qn("ct:Override")) if _part_key(node.get("PartName", "")) == part_name),
             None,
         )
+        if declaration is not None and declaration.get("ContentType", "").translate(_ASCII_LOWER) != mime:
+            raise CorruptedTemplateError(f"Invalid DOCX {related.kind} ContentType: {name}")
         if declaration is None:
-            declaration = etree.SubElement(root, qn("ct:Override"), PartName=_part_uri(f"/{name}"))
-        if declaration.get("ContentType") != mime:
-            declaration.set("ContentType", mime)
+            etree.SubElement(root, qn("ct:Override"), PartName=_part_uri(f"/{name}"), ContentType=mime)
             replacements[content_types.name] = TemplatePart(content_types.name, serialize_xml(root), True)
-    if related.target is not None:
-        return False
     rel_name = related.rels_name
     rels = _relationship_root(replacements.get(rel_name) or package.parts.get(rel_name))
     used = {node.get("Id") for node in rels}

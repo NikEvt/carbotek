@@ -44,6 +44,19 @@ def _relationships(*nodes: str) -> str:
     return f'<p:Relationships xmlns:p="{NAMESPACES["rel"]}">{"".join(nodes)}</p:Relationships>'
 
 
+def _manifest(**parts: str) -> str:
+    overrides = "".join(
+        f'<Override PartName="/{name}" ContentType="{_MIME}{kind}+xml"/>' for kind, name in parts.items()
+    )
+    return (
+        f'<Types xmlns="{NAMESPACES["ct"]}">'
+        '<Default Extension="xml" ContentType="application/xml"/>'
+        '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+        f'<Override PartName="/word/document.xml" ContentType="{_MIME}document.main+xml"/>'
+        f"{overrides}</Types>"
+    )
+
+
 def _values(xml: etree._Element, tag: str) -> list[str]:
     return [node.get(qn("w:val"), "") for node in xml.iter(qn(f"w:{tag}"))]
 
@@ -201,24 +214,33 @@ def test_html_recognizes_linked_part_uri_and_manifest_override(target: str, part
         assert {name for name in archive.namelist() if name.startswith("parts/")} == {part_name}
 
 
-@pytest.mark.parametrize("styles_name", ["parts/styles.xml", "parts/%D1%81%D1%82%D0%B8%D0%BB%D0%B8.xml"])
-def test_html_creates_missing_parts_at_existing_internal_targets(styles_name: str) -> None:
-    rels = _relationships(
-        _relationship("styles", f"../{styles_name}", "rIdStyles"),
-        _relationship("numbering", "/parts/numbering.xml", "rIdNumbering"),
-    )
+@pytest.mark.parametrize("kind", _KINDS)
+@pytest.mark.parametrize("target", ["../parts/missing.xml", "/parts/%D1%81.xml"])
+def test_html_rejects_missing_linked_part_only_when_used(kind: str, target: str) -> None:
+    rels = _relationships(_relationship(kind, target, "rIdPart"))
     template = document(paragraph("{d.html:html}"), **{_RELS_NAME: rels})
-    output = Engine().render(template, {"html": "<h1>Section</h1><ul><li>Bullet</li></ul>"})
-    assert root(output, styles_name)[0].get(qn("w:styleId")) == "Heading1"
-    (bullet_id,) = _values(root(output), "numId")
-    assert _number_formats(root(output, "parts/numbering.xml"))[bullet_id][1] == "bullet"
-    assert {node.get("PartName") for node in root(output, _MANIFEST).findall(qn("ct:Override"))} == {
-        "/word/document.xml",
-        f"/{styles_name}",
-        "/parts/numbering.xml",
-    }
-    with ZipFile(BytesIO(output)) as archive:
-        assert archive.read(_RELS_NAME) == rels.encode()
+    Engine().render(template, {"html": "<p>Plain</p>"})
+    with pytest.raises(CorruptedTemplateError, match=f"Missing DOCX {kind} relationship target"):
+        Engine().render(template, {"html": _HTML})
+
+
+@pytest.mark.parametrize("kind", _KINDS)
+@pytest.mark.parametrize("linked", [True, False])
+def test_html_rejects_incompatible_part_override(kind: str, linked: bool) -> None:
+    part_name = f"word/{kind}.xml"
+    manifest = _manifest(**{kind: part_name}).replace(f"{_MIME}{kind}+xml", "application/xml")
+    rels = _relationships(*([_relationship(kind, f"{kind}.xml", "rIdPart")] if linked else []))
+    template = document(
+        paragraph("{d.html:html}"),
+        **{
+            _RELS_NAME: rels,
+            _MANIFEST: manifest,
+            part_name: _STYLES if kind == "styles" else _NUMBERING,
+        },
+    )
+    Engine().render(template, {"html": "<p>Plain</p>"})
+    with pytest.raises(CorruptedTemplateError, match=f"Invalid DOCX {kind} ContentType"):
+        Engine().render(template, {"html": _HTML})
 
 
 def test_html_preserves_existing_numbering_ids_and_cleanup_order() -> None:
@@ -233,7 +255,7 @@ def test_html_preserves_existing_numbering_ids_and_cleanup_order() -> None:
     )
     template = document(
         _EXISTING_BODY + paragraph("{d.html:html}"),
-        **{_RELS_NAME: rels, part_name: numbering},
+        **{_RELS_NAME: rels, part_name: numbering, _MANIFEST: _manifest(numbering=part_name)},
     )
     output = Engine().render(template, {"html": "<ul><li>Bullet</li></ul>"})
     rendered = root(output, part_name)
@@ -251,7 +273,11 @@ def test_html_uses_free_numbering_id_when_maximum_exists() -> None:
     rels = _relationships(_relationship("numbering", f"/{part_name}", "rIdNumbering"))
     template = document(
         paragraph("{d.html:html}"),
-        **{_RELS_NAME: rels, part_name: _NUMBERING.replace("1000", "2147483647")},
+        **{
+            _RELS_NAME: rels,
+            part_name: _NUMBERING.replace("1000", "2147483647"),
+            _MANIFEST: _manifest(numbering=part_name),
+        },
     )
     output = Engine().render(template, {"html": "<ul><li>Bullet</li></ul>"})
     (bullet_id,) = _values(root(output), "numId")
@@ -279,3 +305,62 @@ def test_html_rejects_external_part_relationship_when_used(kind: str) -> None:
     assert root(Engine().render(template, {"html": "<p>Plain</p>"}), _RELS_NAME)[0].get("TargetMode") == "External"
     with pytest.raises(CorruptedTemplateError, match=f"DOCX {kind} relationship must be internal"):
         Engine().render(template, {"html": _HTML})
+
+
+@pytest.mark.parametrize("kind", _KINDS)
+@pytest.mark.parametrize("mime", ["valid", "uppercase", "wrong", "missing"])
+@pytest.mark.parametrize("stem", ["regular", ""])
+def test_html_resolves_linked_part_default_content_type(kind: str, mime: str, stem: str) -> None:
+    part_name = f"parts/{stem}.part"
+    manifest = _manifest()
+    if mime != "missing":
+        content_type = f"{_MIME}{kind}+xml" if mime in {"valid", "uppercase"} else "application/xml"
+        if mime == "uppercase":
+            content_type = content_type.upper()
+        manifest = manifest.replace("</Types>", f'<Default Extension="PART" ContentType="{content_type}"/></Types>')
+    rels = _relationships(_relationship(kind, f"/{part_name}", "rIdPart"))
+    template = document(
+        paragraph("{d.html:html}"),
+        **{_RELS_NAME: rels, _MANIFEST: manifest, part_name: _STYLES if kind == "styles" else _NUMBERING},
+    )
+    Engine().render(template, {"html": "<p>Plain</p>"})
+    html = "<h1>Section</h1>" if kind == "styles" else "<ul><li>Bullet</li></ul>"
+    if mime not in {"valid", "uppercase"}:
+        with pytest.raises(CorruptedTemplateError, match=f"Invalid DOCX {kind} ContentType"):
+            Engine().render(template, {"html": html})
+    else:
+        output = Engine().render(template, {"html": html})
+        with ZipFile(BytesIO(output)) as archive:
+            assert archive.read(_MANIFEST) == manifest.encode()
+
+
+@pytest.mark.parametrize("linked", [True, False])
+def test_html_accepts_case_equivalent_content_type_override(linked: bool) -> None:
+    manifest = _manifest(styles="word/styles.xml").replace(f"{_MIME}styles+xml", f"{_MIME}styles+xml".upper())
+    rels = _relationships(*([_relationship("styles", "styles.xml", "rIdStyles")] if linked else []))
+    template = document(
+        paragraph("{d.html:html}"),
+        **{
+            _MANIFEST: manifest,
+            _RELS_NAME: rels,
+            "word/styles.xml": _STYLES,
+        },
+    )
+    output = Engine().render(template, {"html": "<h1>Section</h1>"})
+    assert _values(root(output), "pStyle") == ["CustomHeading"]
+    with ZipFile(BytesIO(output)) as archive:
+        assert archive.read(_MANIFEST) == manifest.encode()
+
+
+def test_html_does_not_use_default_for_extensionless_part() -> None:
+    manifest = _manifest().replace("</Types>", f'<Default Extension="styles" ContentType="{_MIME}styles+xml"/></Types>')
+    template = document(
+        paragraph("{d.html:html}"),
+        **{
+            _MANIFEST: manifest,
+            "styles": _STYLES,
+            _RELS_NAME: _relationships(_relationship("styles", "/styles", "rIdStyles")),
+        },
+    )
+    with pytest.raises(CorruptedTemplateError, match="Invalid DOCX styles ContentType"):
+        Engine().render(template, {"html": "<h1>Section</h1>"})
