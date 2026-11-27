@@ -152,6 +152,23 @@ def test_string_formula_cache_can_exceed_the_text_limit(engine: Engine) -> None:
     assert _read_cell_text(engine.render(template, {"cached": value}), "v") == [value, "2"]
 
 
+@pytest.mark.parametrize("text", ["Report", "文" * 16_384], ids=["short", "multibyte"])
+def test_inline_validation_allows_a_following_large_formula_cache(engine: Engine, text: str) -> None:
+    template = _workbook(
+        f'<c t="inlineStr"><is><t>{text}</t></is></c><c t="str"><f>"Report"</f><v>{{d.cached}}</v></c>'
+    )
+    value = "X" * 11_000_000
+    output = engine.render(template, {"cached": value})
+    with ZipFile(BytesIO(output)) as archive:
+        assert b"<v>" + value.encode() + b"</v>" in archive.read(_MAIN)
+
+
+def test_very_long_rendered_inline_text_keeps_the_excel_diagnostic(engine: Engine) -> None:
+    template = _workbook('<c t="inlineStr"><is><t>{d.note}</t></is></c>')
+    with pytest.raises(TemplateError, match=r"32767 UTF-16 code unit limit in 'Report'!A1"):
+        engine.render(template, {"note": "X" * 11_000_000})
+
+
 @pytest.mark.parametrize("supplementary", ["😀", "_xD83D__xDE00_"], ids=["literal", "escaped"])
 def test_supplementary_characters_use_two_utf16_units(engine: Engine, supplementary: str) -> None:
     template = _workbook('<c t="inlineStr"><is><t>{d.note}</t></is></c>')
@@ -280,12 +297,15 @@ def test_relationship_targets_use_opc_case_equivalence(engine: Engine, length: i
             engine.render(template, {"note": value})
 
 
-def test_cell_reference_after_preparation_fills_gaps(engine: Engine) -> None:
-    template = _workbook('<c r="AA3" t="inlineStr"><is><t>{d.note}</t></is></c>')
+@pytest.mark.parametrize("legacy", [False, True])
+def test_inferred_reference_depends_on_preserving_gaps(engine: Engine, legacy: bool) -> None:
+    option = "{o.preReleaseFeatureIn=0}" if legacy else ""
+    template = _workbook(f'<c r="AA3" t="inlineStr"><is><t>{option}{{d.note}}</t></is></c>')
     with ZipFile(BytesIO(template)) as archive:
         sheet = archive.read(_MAIN).replace(b'<row r="1">', b'<row r="3">')
     template = _rewrite_book(template, {_MAIN: sheet})
-    with pytest.raises(TemplateError, match=r"'Report'!AA3"):
+    location = "'Report'" if legacy else "'Report'!AA3"
+    with pytest.raises(TemplateError, match=rf"{location}$"):
         engine.render(template, {"note": "A" * (_LIMIT + 1)})
 
 

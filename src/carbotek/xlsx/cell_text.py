@@ -9,6 +9,7 @@ from lxml import etree  # pyright: ignore[reportAttributeAccessIssue] lxml has i
 
 from carbotek.docx.dialect import SHEET_NAMESPACE
 from carbotek.errors import TemplateError
+from carbotek.ooxml.fragments import RENDERED_TAG
 from carbotek.ooxml.ns import NAMESPACES, qn
 from carbotek.ooxml.parts import target_name
 from carbotek.ooxml.xml import parse_xml
@@ -37,7 +38,7 @@ _CANDIDATES = {
 }
 
 
-def validate_cell_text(package: TemplatePackage) -> None:
+def validate_cell_text(package: TemplatePackage, *, infer_reference: bool) -> None:
     """Reject strings above Excel's cell limit before writing the workbook."""
     for sheet_name, part in _worksheets(package):
         # Serialization expands any render fragments stored as tree placeholders.
@@ -45,14 +46,14 @@ def validate_cell_text(package: TemplatePackage) -> None:
         # XML parts have already been validated and normalized to UTF-8 by preparation.
         if part.is_xml and _inline_text_fits(content):
             continue
-        root = parse_xml(content, part.name)
+        root = _worksheet_tree(part, content)
         name = etree.QName(root)
         if name.localname != "worksheet" or name.namespace not in _CANDIDATES:
             continue
         for cell in _CANDIDATES[name.namespace](root, limit=_CELL_TEXT_LIMIT // 2):
             if _cell_text_length(cell, name.namespace) <= _CELL_TEXT_LIMIT:
                 continue
-            reference = _cell_reference(cell)
+            reference = _cell_reference(cell, infer=infer_reference)
             location = repr(sheet_name) if sheet_name else part.name
             if reference:
                 location += f"!{reference}"
@@ -74,9 +75,20 @@ def _inline_text_fits(content: bytes) -> bool:
         segments = content.split(b"<is>")
         if content.count(b"<is") == len(segments) - 1:
             # A segment with no close may be the start of a nested element.
-            return all(len(segment) <= _CELL_TEXT_LIMIT and b"</is>" in segment for segment in segments[1:])
+            return all(segment.find(b"</is>", 0, _CELL_TEXT_LIMIT + len(b"</is>")) >= 0 for segment in segments[1:])
     segments = _INLINE_START.split(content)
-    return all(len(segment) <= _CELL_TEXT_LIMIT and _INLINE_END.search(segment) for segment in segments[1:])
+    return all(
+        (end := _INLINE_END.search(segment)) is not None and end.start() <= _CELL_TEXT_LIMIT for segment in segments[1:]
+    )
+
+
+def _worksheet_tree(part: TemplatePart, content: bytes) -> etree._Element:
+    if part.has_tree:
+        root: etree._Element = part.tree()
+        # Fragment placeholders hide cells until the final worksheet is serialized.
+        if next(root.iter(RENDERED_TAG), None) is None:
+            return root
+    return parse_xml(content, part.name)
 
 
 def _related_parts(root: etree._Element, source: str, relation: str) -> Iterator[tuple[str, str]]:
@@ -141,11 +153,11 @@ def _column_number(reference: str) -> int:
     return column_number(reference) if _CELL_REFERENCE.fullmatch(reference) else 0
 
 
-def _cell_reference(cell: etree._Element) -> str:
+def _cell_reference(cell: etree._Element, *, infer: bool) -> str:
     if (reference := cell.get("r")) is not None:
         return reference if _CELL_REFERENCE.fullmatch(reference) else ""
     parent = cell.getparent()
-    if parent is None:
+    if not infer or parent is None:
         return ""
     row = _position(parent, _row_number)
     column = _position(cell, _column_number)

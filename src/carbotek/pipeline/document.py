@@ -111,7 +111,7 @@ class RenderDocument:
         self.renderer.execute_sets(compiled.sets, session)
         if package.kind == "xlsx":
             package = _restore_literals(self._render_workbook(package, data, options, compiled.plans), session)
-            validate_cell_text(package)
+            validate_cell_text(package, infer_reference=compiled.xlsx_preserves_cell_positions)
             return self.repository.dump(package)
         # Main phase: loops, fields and directives; feature markers are frozen to item paths.
         for part in package.parts.values():
