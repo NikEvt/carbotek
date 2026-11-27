@@ -107,7 +107,20 @@ def _worksheet_tree(part: TemplatePart, content: bytes) -> etree._Element:
         cause = error.__cause__
         if not isinstance(cause, etree.XMLSyntaxError) or "Text node too long" not in cause.msg:
             raise
-        return parse_xml(content, part.name, target=_TextCheckTree(part.name))
+
+    # A target-built tree has no document type metadata. This target rejects DTDs during parsing.
+    parser = etree.XMLParser(
+        target=_TextCheckTree(part.name),
+        resolve_entities=False,
+        no_network=True,
+        huge_tree=False,
+        remove_blank_text=False,
+        strip_cdata=False,
+    )
+    try:
+        return etree.fromstring(content, parser=parser)
+    except etree.XMLSyntaxError as error:
+        raise CorruptedTemplateError(f"Invalid XML in {part.name}") from error
 
 
 class _TextCheckTree(etree.TreeBuilder):
