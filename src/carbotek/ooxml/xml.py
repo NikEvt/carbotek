@@ -7,17 +7,30 @@ either an attack (XXE, entity expansion) or a corrupted part.
 """
 
 import re
+from typing import TypedDict
 
 from lxml import etree  # pyright: ignore[reportAttributeAccessIssue] lxml has incomplete stubs.
 
 from carbotek.errors import CorruptedTemplateError
 
 
-def parse_xml(content: bytes | str, name: str = "XML part") -> etree._Element:
-    """Parse untrusted XML with the safe settings; raise ``CorruptedTemplateError`` on any problem."""
+class _TargetOption(TypedDict, total=False):
+    target: etree.TreeBuilder
+
+
+def parse_xml(
+    content: bytes | str, name: str = "XML part", *, target: etree.TreeBuilder | None = None
+) -> etree._Element:
+    """Parse untrusted XML with safe settings. A custom target must reject DTDs in its doctype callback."""
     # A parser per call: lxml parser objects must not be shared between threads.
+    target_option: _TargetOption = {"target": target} if target is not None else {}
     parser = etree.XMLParser(
-        resolve_entities=False, no_network=True, huge_tree=False, remove_blank_text=False, strip_cdata=False
+        resolve_entities=False,
+        no_network=True,
+        huge_tree=False,
+        remove_blank_text=False,
+        strip_cdata=False,
+        **target_option,
     )
     payload = content.encode("utf-8") if isinstance(content, str) else content
     try:

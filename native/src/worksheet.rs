@@ -3,6 +3,7 @@ use memchr::memchr_iter;
 /// Bound inline text in normalized, well-formed XML by its escaped UTF-8 size.
 /// Ambiguous markup and nested inline elements require the exact XML check.
 pub(crate) fn inline_text_fits(xml: &[u8], limit: usize) -> bool {
+    let xml = xml.strip_prefix(b"\xef\xbb\xbf").unwrap_or(xml);
     let mut open = None;
     for start in memchr_iter(b'<', xml) {
         let tag = &xml[start + 1..];
@@ -69,5 +70,12 @@ mod tests {
         ] {
             assert!(!inline_text_fits(xml, 100));
         }
+    }
+
+    #[test]
+    fn accepts_a_utf8_bom_before_the_xml_declaration() {
+        let xml = b"\xef\xbb\xbf<?xml version='1.0'?><is><t>abc</t></is>";
+        assert!(inline_text_fits(xml, 10));
+        assert!(!inline_text_fits(xml, 9));
     }
 }

@@ -8,7 +8,7 @@ import pytest
 from lxml import etree
 
 from carbotek import Engine
-from carbotek.errors import TemplateError
+from carbotek.errors import CorruptedTemplateError, TemplateError
 from carbotek.ooxml.xml import parse_xml
 from carbotek.package import TemplatePart
 from carbotek.xlsx import cell_text
@@ -175,6 +175,30 @@ def test_string_formula_cache_can_exceed_the_text_limit(engine: Engine) -> None:
     assert _read_cell_text(engine.render(template, {"cached": value}), "v") == [value, "2"]
 
 
+@pytest.mark.parametrize("length", [_LIMIT, _LIMIT + 1])
+def test_exact_reparse_ignores_large_formula_cache(engine: Engine, length: int) -> None:
+    template = _workbook('<c t="inlineStr"><is><t>{d.note}</t></is></c><c t="str"><f>"Report"</f><v>{d.cached}</v></c>')
+    literal = "{d.literal}"
+    note = literal + "文" * (length - len(literal))
+    cached = "X" * 11_000_000
+    if length > _LIMIT:
+        with pytest.raises(TemplateError, match=r"'Report'!A1$"):
+            engine.render(template, {"note": note, "cached": cached})
+        return
+    with ZipFile(BytesIO(engine.render(template, {"note": note, "cached": cached}))) as archive:
+        content = archive.read(_MAIN)
+    assert b"<t>" + note.encode() + b"</t>" in content
+    assert b"<v>" + cached.encode() + b"</v>" in content
+
+
+def test_exact_reparse_still_rejects_dtd() -> None:
+    content = (
+        b"<!DOCTYPE worksheet>" + _worksheet('<c t="str"><f>"Report"</f><v>' + "X" * 11_000_000 + "</v></c>").encode()
+    )
+    with pytest.raises(CorruptedTemplateError):
+        cell_text._worksheet_tree(TemplatePart(_MAIN, content, True), content)
+
+
 @pytest.mark.parametrize("text", ["Report", "文" * 16_384], ids=["short", "multibyte"])
 def test_inline_validation_allows_a_following_large_formula_cache(engine: Engine, text: str) -> None:
     template = _workbook(
@@ -210,6 +234,48 @@ def _rewrite_book(book: bytes, replacements: dict[str, bytes], rename: dict[str,
         for name, content in parts.items():
             target.writestr((rename or {}).get(name, name), content)
     return stream.getvalue()
+
+
+@pytest.mark.parametrize("length", [_LIMIT, _LIMIT + 1])
+def test_validates_shared_strings_kept_in_a_linked_part(engine: Engine, length: int) -> None:
+    template = _workbook("<c r=\"A1\" t='s'><v>0</v></c>", shared="{d.note}")
+    with ZipFile(BytesIO(template)) as archive:
+        parts = {
+            name: archive.read(name).replace(b"sharedStrings.xml", b"cell-values.xml") for name in archive.namelist()
+        }
+    template = _rewrite_book(template, parts, {"xl/sharedStrings.xml": "xl/cell-values.xml"})
+    value = "😀" + "Я" * (length - 2)
+    if length > _LIMIT:
+        with pytest.raises(TemplateError, match=r"'Report'!A1$"):
+            engine.render(template, {"note": value})
+    else:
+        output = engine.render(template, {"note": value})
+        assert _read_cell_text(output, part="xl/cell-values.xml") == [value]
+
+
+def test_unused_oversized_shared_string_does_not_reject_workbook(engine: Engine) -> None:
+    template = _workbook("<c r=\"A1\" t='s'><v>1</v></c>", shared="{d.note}")
+    with ZipFile(BytesIO(template)) as archive:
+        parts = {
+            name: archive.read(name).replace(b"sharedStrings.xml", b"cell-values.xml") for name in archive.namelist()
+        }
+    parts["xl/sharedStrings.xml"] = parts["xl/sharedStrings.xml"].replace(b"</sst>", b"<si><t>short</t></si></sst>")
+    template = _rewrite_book(template, parts, {"xl/sharedStrings.xml": "xl/cell-values.xml"})
+    output = engine.render(template, {"note": "X" * (_LIMIT + 1)})
+    assert _read_cell_text(output, "v") == ["1"]
+    assert _read_cell_text(output, part="xl/cell-values.xml")[1] == "short"
+
+
+def test_bom_does_not_force_an_exact_worksheet_parse(engine: Engine, monkeypatch: pytest.MonkeyPatch) -> None:
+    content = b'\xef\xbb\xbf<?xml version="1.0" encoding="UTF-8"?>'
+    content += _worksheet('<c t="inlineStr"><is><t>short</t></is></c>').encode()
+    template = _rewrite_book(_workbook(""), {_MAIN: content})
+
+    def unexpected_parse(part: TemplatePart, content: bytes) -> etree._Element:
+        pytest.fail(f"Unexpected exact validation for {part.name}")
+
+    monkeypatch.setattr(cell_text, "_worksheet_tree", unexpected_parse)
+    assert _read_cell_text(engine.render(template, {})) == ["short"]
 
 
 @pytest.mark.parametrize("kind", ["plain", "rich"])
