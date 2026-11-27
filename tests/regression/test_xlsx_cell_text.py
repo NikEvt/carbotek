@@ -9,6 +9,8 @@ from lxml import etree
 
 from carbotek import Engine
 from carbotek.errors import TemplateError
+from carbotek.ooxml.xml import parse_xml
+from carbotek.package import TemplatePart
 from carbotek.xlsx import cell_text
 
 _SHEET = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
@@ -89,6 +91,27 @@ def test_rendered_text_limit(engine: Engine, length: int) -> None:
             engine.render(template, data)
         assert literal not in str(error.value)
         assert "Я" not in str(error.value)
+
+
+def test_diagnostic_escapes_apostrophes_in_sheet_name(engine: Engine) -> None:
+    book = _workbook('<c r="A1" t="inlineStr"><is><t>{d.note}</t></is></c>')
+    with ZipFile(BytesIO(book)) as archive:
+        workbook = archive.read("xl/workbook.xml").replace(b"Report", b"O'Brien")
+    book = _rewrite_book(book, {"xl/workbook.xml": workbook})
+    with pytest.raises(TemplateError, match=r"'O''Brien'!A1$"):
+        engine.render(book, {"note": "A" * (_LIMIT + 1)})
+
+
+def test_exact_validation_preserves_serialized_worksheet() -> None:
+    part = TemplatePart.from_tree(_MAIN, parse_xml(_worksheet().encode(), _MAIN))
+    content = part.content
+
+    root = cell_text._worksheet_tree(part, content)
+    assert part.content is content
+
+    part.tree().set("changed", "1")
+    assert root.get("changed") == "1"
+    assert b'changed="1"' in part.content
 
 
 def test_concatenated_markers_can_exceed_the_limit(engine: Engine) -> None:

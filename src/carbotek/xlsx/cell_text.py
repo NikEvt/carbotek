@@ -3,15 +3,15 @@
 
 import re
 from collections.abc import Callable, Iterator
-from pathlib import PurePosixPath
 
 from lxml import etree  # pyright: ignore[reportAttributeAccessIssue] lxml has incomplete stubs.
 
+from carbotek._native_adapter import native_inline_text_fits
 from carbotek.docx.dialect import SHEET_NAMESPACE
 from carbotek.errors import TemplateError
 from carbotek.ooxml.fragments import RENDERED_TAG
 from carbotek.ooxml.ns import NAMESPACES, qn
-from carbotek.ooxml.parts import target_name
+from carbotek.ooxml.parts import part_key, relationship_part_name, target_name
 from carbotek.ooxml.xml import parse_xml
 from carbotek.package import TemplatePackage, TemplatePart
 
@@ -26,7 +26,6 @@ _CELL_TEXT_LIMIT = 32_767
 _XSTRING_ESCAPE = re.compile(r"_x[0-9a-fA-F]{4}_")
 _INLINE_START = re.compile(rb"<(?:[^\s<>/:]+:)?is(?=[\x20\t\r\n/>])")
 _INLINE_END = re.compile(rb"</(?:[^\s<>/:]+:)?is[\x20\t\r\n]*>")
-_ASCII_LOWER = str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz")
 
 # XPath counts code points. A code point needs at most two UTF-16 units.
 _CANDIDATES = {
@@ -54,7 +53,7 @@ def validate_cell_text(package: TemplatePackage, *, infer_reference: bool) -> No
             if _cell_text_length(cell, name.namespace) <= _CELL_TEXT_LIMIT:
                 continue
             reference = _cell_reference(cell, infer=infer_reference)
-            location = repr(sheet_name) if sheet_name else part.name
+            location = "'" + sheet_name.replace("'", "''") + "'" if sheet_name else part.name
             if reference:
                 location += f"!{reference}"
             raise TemplateError(
@@ -64,6 +63,11 @@ def validate_cell_text(package: TemplatePackage, *, infer_reference: bool) -> No
 
 def _inline_text_fits(content: bytes) -> bool:
     """Skip the XML pass when each inline string occupies at most the limit in bytes."""
+    native_result = native_inline_text_fits(content, _CELL_TEXT_LIMIT)
+    return _python_inline_text_fits(content) if native_result is None else native_result
+
+
+def _python_inline_text_fits(content: bytes) -> bool:
     if b"<!" in content:
         return False  # Comments and CDATA can contain apparent tag delimiters.
     instruction = content.find(b"<?")
@@ -84,7 +88,7 @@ def _inline_text_fits(content: bytes) -> bool:
 
 def _worksheet_tree(part: TemplatePart, content: bytes) -> etree._Element:
     if part.has_tree:
-        root: etree._Element = part.tree()
+        root: etree._Element = part.tree(readonly=True)
         # Fragment placeholders hide cells until the final worksheet is serialized.
         if next(root.iter(RENDERED_TAG), None) is None:
             return root
@@ -101,18 +105,17 @@ def _related_parts(root: etree._Element, source: str, relation: str) -> Iterator
 
 def _worksheets(package: TemplatePackage) -> Iterator[tuple[str, TemplatePart]]:
     # OPC part URI equivalence ignores ASCII case; preserve actual names for diagnostics.
-    parts = {name.translate(_ASCII_LOWER): part for name, part in package.parts.items()}
-    package_rels = parts.get("_rels/.rels")
+    parts = {part_key(name): part for name, part in package.parts.items()}
+    package_rels = parts.get(relationship_part_name(""))
     if package_rels is None:
         return
     root = parse_xml(package_rels.content, package_rels.name)
     workbook = next((name for _, name in _related_parts(root, "", "officeDocument")), None)
-    workbook_part = parts.get(workbook.translate(_ASCII_LOWER)) if workbook is not None else None
+    workbook_part = parts.get(part_key(workbook)) if workbook is not None else None
     if workbook_part is None:
         return
     workbook = workbook_part.name
-    path = PurePosixPath(workbook)
-    workbook_rels = parts.get(str(path.parent / "_rels" / f"{path.name}.rels").translate(_ASCII_LOWER))
+    workbook_rels = parts.get(part_key(relationship_part_name(workbook)))
     if workbook_rels is None:
         return
     root = parse_xml(workbook_part.content, workbook)
@@ -127,7 +130,7 @@ def _worksheets(package: TemplatePackage) -> Iterator[tuple[str, TemplatePart]]:
     }
     relations = parse_xml(workbook_rels.content, workbook_rels.name)
     for id_, target in _related_parts(relations, workbook, "worksheet"):
-        if id_ in sheet_names and (part := parts.get(target.translate(_ASCII_LOWER))) is not None:
+        if id_ in sheet_names and (part := parts.get(part_key(target))) is not None:
             yield sheet_names[id_], part
 
 
